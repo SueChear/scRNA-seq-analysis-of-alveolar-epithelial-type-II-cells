@@ -1,0 +1,518 @@
+---
+output:
+  html_document:
+    code_folding: hide
+---
+
+#### **Single cell RNA sequencing analysis of ChiPSC18-derived AEC2s Part 2**  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(DoubletFinder)
+library(ggplot2)
+library(scPred)
+library(dplyr)
+library(cowplot)
+```
+
+1. Data from 3 independent replicates were merged into one Seurat object.
+
+```{r,message=FALSE,warning=FALSE,results='hide'}
+MergedAEC2<-readRDS("MergedAEC2.RDS")
+MergedAEC2<-PercentageFeatureSet(MergedAEC2,pattern="^MT-", col.name="percent.Mt")
+MergedAEC2<-PercentageFeatureSet(MergedAEC2,pattern='^RP[SL]', col.name=
+                                               "percent.Rb")
+```
+
+
+2. Quality control: Visualize QC metrics in violin plots.
+
+```{r}
+VlnPlot(MergedAEC2, features=c("nFeature_RNA","nCount_RNA","percent.Mt","percent.Rb"),
+        ncol=4)
+```
+
+3. Filtered out low-quality cells (low/high transript counts, dead cells, high mitochondrial %) based on thresholds determined from QC plots above.
+
+```{r}
+MergedAEC2_postfilter<-subset(MergedAEC2, subset=nFeature_RNA>2500 & 
+                                nFeature_RNA <10000 & nCount_RNA>7000 & 
+                                nCount_RNA <70000 &
+                                percent.Mt <10 & percent.Rb<45)
+```
+
+
+4. Filtered out doublets with DoubletFinder.
+
+```{r,message=FALSE,warning=FALSE,results='hide', fig.show='hide'}
+MergedAEC2.split<-SplitObject(MergedAEC2_postfilter, split.by='orig.ident')
+
+for (i in 1:length(MergedAEC2.split)) {
+  # print the sample we are on
+  print(paste0("Sample ",i))
+  
+  AEC2.sample<-NormalizeData(MergedAEC2.split[[i]])
+  AEC2.sample<-FindVariableFeatures(AEC2.sample)
+  AEC2.sample<-ScaleData(AEC2.sample)
+  AEC2.sample <- RunPCA(AEC2.sample)
+  
+  #find significant PCs
+  ElbowPlot(AEC2.sample)
+  
+  #finish pre-processing
+  AEC2.sample<-RunUMAP(AEC2.sample, dims=1:10)
+  AEC2.sample<-FindNeighbors(AEC2.sample, dims=1:10)
+  AEC2.sample<-FindClusters(AEC2.sample, resolution=0.3)
+  
+  # pK identification (no ground-truth)
+  sweep.list <- paramSweep_v3(AEC2.sample, PCs = 1:10, sct=F)
+  sweep.stats <- summarizeSweep(sweep.list, GT=FALSE) ##GT is a vector containing "singlet"&"doublet"cells recorded using sample multiplexing classification.
+  bcmvn <- find.pK(sweep.stats)
+  
+  # Optimal pK is the max of the bomodality coefficent (BCmvn) distribution
+  bcmvn.max <- bcmvn[which.max(bcmvn$BCmetric),]
+  optimal.pk <- bcmvn.max$pK
+  optimal.pk <- as.numeric(levels(optimal.pk))[optimal.pk]
+  
+  ## Homotypic doublet proportion estimate
+  annotations <- AEC2.sample@meta.data$seurat_clusters 
+  homotypic.prop <- modelHomotypic(annotations)            ##ex: annotations<-AEC.sample@meta.data$ClusteringResults
+  nExp.poi <- round(optimal.pk * nrow(AEC2.sample@meta.data)) ## Assuming 7.5% doublet formation rate - tailor for your dataset
+  nExp.poi.adj <- round(nExp.poi * (1 - homotypic.prop))
+  
+  # run DoubletFinder
+  
+  AEC2.sampleDF <- doubletFinder_v3(seu = AEC2.sample, 
+                                    PCs = 1:10, 
+                                    pK = optimal.pk,
+                                    nExp = nExp.poi.adj,
+                                    reuse.pANN=FALSE,
+                                    sct=F)
+  
+  colnames(AEC2.sampleDF@meta.data)[9]<-"doublet_finder"
+  
+  DimPlot(AEC2.sampleDF, reduction='umap', group.by="doublet_finder")
+  ggsave(filename = paste0('doublet_AEC2B', i, '.jpg'), width=30, height =16, unit="cm", dpi=600)
+  
+
+  # subset and save
+  MergedAEC2.split[[i]] <- subset(AEC2.sampleDF, doublet_finder == "Singlet")
+}
+```
+
+
+```{r}
+AEC2.singlets <- merge(x = MergedAEC2.split[[1]],
+                        y = c(MergedAEC2.split[[2]], MergedAEC2.split[[3]]),
+                        project = "AEC2 scRNAseq") 
+MergedAEC2.list<-SplitObject(AEC2.singlets, split.by='orig.ident')
+```
+
+
+UMAP Plots showing doublets in each replicate.
+
+i. AEC2_B1  
+
+![](doublet_AEC2B1.jpg)
+
+ii. AEC2_B2  
+
+![](doublet_AEC2B2.jpg)
+
+iii. AEC2_B3  
+
+![](doublet_AEC2B3.jpg)
+
+Initial cell count: 16836 cells  
+
+```{r}
+MergedAEC2
+```
+
+
+After initial filtering: 8441 cells  
+
+```{r}
+MergedAEC2_postfilter
+
+```
+
+After filtering doublets: 7509 cells for downstream analysis  
+
+```{r}
+AEC2.singlets
+```
+A total of 932 doublets were filtered out from 3 replicates.
+
+5. Data normalization using SCTransform.
+
+```{r, results="hide"}
+MergedAEC2.sct.list<-lapply(X=MergedAEC2.list, FUN=function(x){
+                            x<-SCTransform(x, vst.flavor="v2",vars.to.regress="percent.Mt", verbose = FALSE)
+                            })
+
+```
+
+
+6. Data integration using Seurat to correct for batch effects.
+
+```{r, results='hide'}
+
+options(future.globals.maxSize = 8000 * 1024^2)
+features<-SelectIntegrationFeatures(MergedAEC2.sct.list, verbose=FALSE)
+
+MergedAEC2.sct.list<-PrepSCTIntegration(MergedAEC2.sct.list, anchor.features=features, verbose=FALSE)
+
+MergedAEC2_sct_anchors<-FindIntegrationAnchors(object.list = MergedAEC2.sct.list,
+                                               normalization.method = "SCT",
+                                               anchor.features=features, verbose=FALSE)
+
+MergedAEC2_sct_integrated<-IntegrateData(anchorset=MergedAEC2_sct_anchors, 
+                                         normalization.method = "SCT", verbose=FALSE)
+
+```
+
+
+
+7. Linear dimensionality reduction  
+
+Identify number of principal components for downstream clustering.This can be visualized through the elbow plot which shows majority of variation is captured in the first 20 principal components.
+Heatmap of first 9 principal components shows top 10 genes contributing to variance in each principal component.
+
+```{r, include=FALSE, results='hide',results = 'hide', warning=FALSE, message=FALSE}
+MergedAEC2_sct_pca<-RunPCA(MergedAEC2_sct_integrated)
+
+```
+
+```{r,results = 'hide' }
+ElbowPlot(MergedAEC2_sct_pca, ndims=50, reduction="pca")
+
+DimHeatmap(MergedAEC2_sct_pca, 
+           dims = 1:9, 
+           cells = 500, 
+           balanced = TRUE)
+```
+
+  
+8. With SCTransform, the more PCs we choose the more variation is accounted for when performing the clustering. I use first 50 PCs to generate 7 clusters (based on number of clusters seen in literature) with resolution=0.22 followed by UMAP non-linear dimensional reduction.  
+
+
+```{r,results = 'hide', warning=FALSE, message=FALSE}
+MergedAEC2_sct_pca<-FindNeighbors(MergedAEC2_sct_pca, dims=1:50, verbose=FALSE)
+
+MergedAEC2_sct_cluster<-FindClusters(MergedAEC2_sct_pca, resolution=0.15, verbose=FALSE)
+
+MergedAEC2_sct_cluster<-RunUMAP(MergedAEC2_sct_cluster, dims=1:50, verbose=FALSE)
+
+DimPlot(MergedAEC2_sct_cluster, reduction="umap",label=TRUE, repel=TRUE)
+```
+
+```{r,echo=FALSE, results='hide', message=FALSE,warning=FALSE,fig.show='hide'}
+# Determine metrics to plot present in MergedAEC2_sct_cluster@meta.data
+metrics <-c("nCount_SCT", "nFeature_SCT","percent.Mt","percent.Rb")
+
+# Extract the UMAP coordinates for each cell and include information about the metrics to plot
+qc_data <- FetchData(MergedAEC2_sct_cluster, 
+                     vars = c(metrics,"ident","UMAP_1","UMAP_2"))
+
+# Adding cluster label to center of cluster on UMAP
+umap_label <- FetchData(MergedAEC2_sct_cluster, 
+                        vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+        as.data.frame() %>% 
+        group_by(ident) %>%
+        summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+
+# Plot a UMAP plot for each metric
+map(metrics, function(qc){
+        ggplot(qc_data,
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=qc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label, 
+                          aes(label=ident, x, y)) +
+                ggtitle(qc)
+}) %>%
+        plot_grid(plotlist = .)
+
+```
+
+
+
+```{r, echo=FALSE, results='hide', message=FALSE,warning=FALSE,fig.show='hide'}
+# Defining the information in the seurat object of interest
+columns <- c(paste0("PC_", 1:16),
+            "ident",
+            "UMAP_1", "UMAP_2")
+
+# Extracting this data from the seurat object
+pc_data <- FetchData(MergedAEC2_sct_cluster, 
+                     vars = columns)
+
+# Extract the UMAP coordinates for the first 10 cells
+MergedAEC2_sct_cluster@reductions$umap@cell.embeddings[1:10, 1:2]
+```
+
+
+```{r, echo=FALSE, results='hide', message=FALSE,warning=FALSE,fig.show='hide'}
+
+# Adding cluster label to center of cluster on UMAP
+umap_label <- FetchData(MergedAEC2_sct_cluster, 
+                        vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+  
+# Plotting a UMAP plot for each of the PCs
+map(paste0("PC_", 1:16), function(pc){
+        ggplot(pc_data, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+
+ggsave("UMAP_PC.jpg", width=30, height =16, unit="cm", dpi=600)
+```
+
+9. Visualization of marker genes in clusters.Canonical markers in the table below are used to match the unbiased clustering to known cell types.  
+
+```{r}
+
+Gene_marker <- c("EPCAM", "NKX2-1", "FOXA2","MKI67","SFTPB, SFTPC, ABCA3, LAMP3, LPCAT1, NAPSA",
+                 "CD47, CPM, KIT", "SCGB1A1, SCGB3A2","TP63, PDPN", "TFF1, CDX2", "AFP, SERPINA1")
+Cell_type <- c("Epithelial cells", "Lung progenitors","Endodermal cells", "Mitotic cells",
+               "AEC2", "Surface markers for AEC2", "Secretory airway cells", "Basal cells",
+               "Gastric cells", "Hepatic cells")
+
+df <- data.frame(Gene_marker, Cell_type)
+df
+
+```
+
+
+```{r, message=FALSE,warning=FALSE,results='hide', fig.show='hide'}
+DefaultAssay(MergedAEC2_sct_cluster)<-"RNA"
+
+FeaturePlot(MergedAEC2_sct_cluster, features=c("EPCAM", "NKX2-1","FOXA2","MKI67", "SFTPB", 
+                                           "SFTPC", "ABCA3", "LAMP3","LPCAT1", "NAPSA"),pt.size = 0.00001, max.cutoff ='q95',cols = c('light gray','yellow', 'red'), label=TRUE)
+
+ggsave("featureplot1_filter.jpg", width=30, height =16, unit="cm", dpi=600)
+```
+i. Feature plot 1: epithelial, endodermal and AEC2 markers  
+
+![](featureplot1.jpg)  
+
+
+```{r,message=FALSE,warning=FALSE,results='hide', fig.show='hide'}
+FeaturePlot(MergedAEC2_sct_cluster, features=c("CD47", "CPM","KIT","SCGB1A1",
+                                           "SCGB3A2","TP63","PDPN","TFF1", "CDX2",
+                                           "AFP","SERPINA1"),pt.size = 0.00001, max.cutoff ='q95',
+            cols = c('light gray','yellow', 'red'), label=TRUE)
+
+ggsave("featureplot2_filter.jpg", width=30, height =16, unit="cm", dpi=600)
+```
+ii. Feature plot 2: AEC2 surface markers, secretory cells, gastric and hepatic cells.  
+
+![](featureplot2.jpg)  
+
+```{r, message=FALSE,warning=FALSE,results='hide', fig.show='hide'}
+VlnPlot(MergedAEC2_sct_cluster, features = c("EPCAM", "NKX2-1","FOXA2","MKI67", "SFTPB", 
+                                           "SFTPC", "ABCA3", "LAMP3","LPCAT1"))
+
+ggsave("violinplot1_filter.jpg", width=30, height =16, unit="cm", dpi=600)
+```
+iii. Violin plot 1: epithelial, endodermal and AEC2 markers 
+
+![](violinplot1.jpg)  
+
+```{r, message=FALSE,warning=FALSE,results='hide', fig.show='hide'}
+VlnPlot(MergedAEC2_sct_cluster, features = c("CD47", "CPM","KIT","SCGB1A1",
+                                           "SCGB3A2","TP63","PDPN","TFF1", "CDX2",
+                                           "AFP","SERPINA1"))
+
+ggsave("violinplot2_filter.jpg", width=30, height =16, unit="cm", dpi=600)
+```
+iv. Violin plot 2: AEC2 surface markers, secretory cells, gastric and hepatic cells.  
+
+![](violinplot2.jpg)  
+
+10. Assign cell type identity to clusters based on markers.  
+
+```{r, message=FALSE,warning=FALSE,results='hide'}
+AEC2.cluster <- RenameIdents(MergedAEC2_sct_cluster, 
+                               `0` = "AEC2", `1` = "AEC2-like",`5` = "AEC2",
+                               `4` = "Unassigned", `3` = "AEC2 mitotic",
+                               `2` = "Unassigned", `6` = "Hepatic")
+
+Idents(AEC2.cluster)
+AEC2.cluster$celltype <- Idents(AEC2.cluster)
+
+DimPlot(AEC2.cluster, group.by = "celltype", label = TRUE, repel = TRUE)
+```
+
+Frequency of each cluster:  
+
+```{r}
+AEC2.clusterfreq <-AEC2.cluster@meta.data %>%
+  group_by(celltype) %>%
+  summarise(count=n()) %>%
+  mutate(relative_frequency = count/sum(count)) %>%
+  mutate(data_set = "AEC2.clusterfreq")
+
+AEC2.clusterfreq
+```
+There weren't any strong marker genes for the unassigned clusters, I looked into the spread of transcript count and features in this cluster, they were lowish, so I went back to initial filtering step to increase min threshold of transcript count and features, lost few hundreds of cells as a result but there is still a cluster of unidentified cells.  
+
+11. Dot plot visualization : gene expression changes across different annotated clusters.  
+
+```{r}
+
+DefaultAssay(AEC2.cluster)<-"RNA"
+DotPlot(AEC2.cluster, features = c("EPCAM","NKX2-1","FOXA2", "MKI67","SFTPB", "SFTPC","LAMP3", "LPCAT1", "ABCA3", "NAPSA","CD47","CPM","KIT","SCGB1A1", "SCGB3A2","TP63","PDPN", "TFF1","CDX2","AFP","SERPINA1")) + theme(axis.text.x = element_text(angle = 90))
+
+```
+
+12. Differential gene expression to find cluster markers.  
+
+```{r, message=FALSE,warning=FALSE,results='hide',fig.show='hide'}
+all.markers <- FindAllMarkers(AEC2.cluster)
+
+DefaultAssay(AEC2.cluster)<-"integrated"
+all.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 50, wt = avg_log2FC) -> top50
+
+```
+
+```{r,message=FALSE,warning=FALSE,results='hide',fig.show='hide'}
+DefaultAssay(AEC2.cluster)<-"integrated"
+DoHeatmap(AEC2.cluster, features = top50$gene)
+
+ggsave("cluster_heatmap.jpg", width=30, height =60, unit="cm", dpi=600)
+```
+
+![](cluster_heatmaphi.jpg) 
+
+
+#### **scPred**  
+
+1. Normalize reference data ( doi: 10.1016/j.stemcr.2018.03.013). I reproduced clusters similar to the one in literature, then using marker genes, identified cell types and annotated the cells to generate reference data.  
+
+```{r, message=FALSE,warning=FALSE,results='hide',fig.show='hide'}
+AEC2_Ref_postfilter<-readRDS("AEC2_Ref_postfilter.RDS")
+
+#### SCTransform and PCA
+
+AEC2Ref.sct <- SCTransform(AEC2_Ref_postfilter, vst.flavor = "v2", vars.to.regress="percent.Mt",verbose = FALSE) %>%
+  RunPCA(npcs = 50, verbose = FALSE) %>%
+  RunUMAP(reduction = "pca", dims = 1:50, verbose = FALSE) %>%
+  FindNeighbors(reduction = "pca", dims = 1:50, verbose = FALSE)
+
+
+AEC2Ref.cluster<-FindClusters(AEC2Ref.sct, resolution=0.3)
+
+
+DimPlot(AEC2Ref.cluster, reduction="umap", pt.size=1)
+
+```
+
+```{r, message=FALSE,warning=FALSE,results='hide'}
+Reference.data <- RenameIdents(AEC2Ref.cluster, 
+                               `0` = "AEC2", `1` = "Basal",`5` = "Gastric",
+                               `4` = "AEC2 mitotic", `3` = "Secretory airway",
+                               `2` = "Hepatic", `6` = "AEC2like")
+
+
+Idents(Reference.data)
+Reference.data$celltype <- Idents(Reference.data)
+
+DimPlot(Reference.data, group.by = "celltype", label = TRUE, repel = TRUE)
+```
+
+```{r}
+
+Ref.clusterfreq <-Reference.data@meta.data %>%
+  group_by(celltype) %>%
+  summarise(count=n()) %>%
+  mutate(relative_frequency = count/sum(count)) %>%
+  mutate(data_set = "Ref.clusterfreq")
+
+Ref.clusterfreq
+```
+
+For comparison between my annotation of the reference data above and the annotation from literature below (doi: 10.1016/j.stemcr.2018.03.013):  
+
+![](Capture.PNG)
+
+
+Number of cells in each cluster between both annotations are comparable, so I proceeded with training a classification model using my annotated reference data.  
+
+2. Train classifiers.The output below shows the number of cells, number of genes used to train the model (50), prediction model (support vector machine with a radial kernel), ROCs and sensitivity, which are sastisfatory.
+
+```{r, message=FALSE,warning=FALSE,results='hide'}
+
+reference <- getFeatureSpace(Reference.data, "celltype")
+
+reference <- trainModel(reference)
+
+get_probabilities(reference) %>% head()
+
+```
+
+```{r}
+get_scpred(reference)
+
+plot_probabilities(reference)
+```
+
+3. Predict cell types on query data.  
+
+```{r,message=FALSE,warning=FALSE, results='hide'}
+query<-AEC2.singlets%>%SCTransform(vst.flavor="v2",vars.to.regress="percent.Mt")
+
+query<-scPredict(query, reference)
+
+query<- RunUMAP(query, reduction = "scpred", dims = 1:30)
+
+DimPlot(query, group.by="scpred_prediction", label=T,repel = T)
+
+```
+
+4. Visualize probabilities of predicted cells on UMAP.  
+
+```{r, fig.show='hide'}
+FeaturePlot(query, c("scpred_AEC2", "scpred_AEC2like", "scpred_Secretory.airway", 
+                     "scpred_Gastric", "scpred_Basal", "scpred_AEC2.mitotic", 
+                     "scpred_Hepatic"))
+
+ggsave("probability.jpg", width=30, height =16, unit="cm", dpi=600)
+```
+
+![](probability.jpg)  
+
+5. Frequency of each cluster.  
+
+```{r}
+query.clusterfreq <-query@meta.data %>%
+  group_by(scpred_prediction) %>%
+  summarise(count=n()) %>%
+  mutate(relative_frequency = count/sum(count)) %>%
+  mutate(data_set = "query.clusterfreq")
+
+query.clusterfreq
+```
+
